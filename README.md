@@ -85,6 +85,104 @@ python train.py \
   --learning_rate 5e-6
 ```
 
+## Generation
+
+You can use the model to generate audio from text input. Here's an example for voice cloning:
+
+```python
+import torch
+from modeling_csm import CSMModel
+from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
+from tokenizers.processors import TemplateProcessing
+from moshi.models import loaders
+from processor import CSMProcessor
+import torchaudio
+
+device = 'cuda'
+
+def load_llama3_tokenizer():
+    """
+    https://github.com/huggingface/transformers/issues/22794#issuecomment-2092623992
+    """
+    tokenizer_name = "meta-llama/Llama-3.2-1B"
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    bos = tokenizer.bos_token
+    eos = tokenizer.eos_token
+    tokenizer._tokenizer.post_processor = TemplateProcessing(
+        single=f"{bos}:0 $A:0 {eos}:0",
+        pair=f"{bos}:0 $A:0 {eos}:0 {bos}:1 $B:1 {eos}:1",
+        special_tokens=[(f"{bos}", tokenizer.bos_token_id), (f"{eos}", tokenizer.eos_token_id)],
+    )
+
+    return tokenizer
+
+text_tokenizer = load_llama3_tokenizer()
+
+mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
+audio_tokenizer = loaders.get_mimi(mimi_weight, device=device)
+audio_tokenizer.set_num_codebooks(32)
+
+processor = CSMProcessor(text_tokenizer, audio_tokenizer)
+
+
+def load_audio(path, target_sr):
+    audio, sr = torchaudio.load(path)
+    audio = audio.squeeze(0)
+    if sr != target_sr:
+        audio = torchaudio.functional.resample(audio, orig_freq=sr, new_freq=target_sr)
+    return audio
+
+
+model = CSMModel.from_pretrained("thomasgauthier/csm-1b-hf", torch_dtype=torch.bfloat16)
+model.to('cuda')
+
+
+inputs = processor(
+    messages=[
+        {
+        "role": "speaker_0",
+        "content": [
+            {"type": "text", "text": "<AUDIO_CLIP_TRANSCRIPT>"},
+            {"type": "audio"} # This placeholder is required for audio tokenization (it maps to the first element in the `audios` list passed to the processor)
+        ]
+    },
+            {
+        "role": "speaker_0",
+        "content": [
+            {"type": "text", "text": "Hello, this is voice cloning speaking"},
+            # does not include audio as the model will generate it
+        ]
+    }
+        ], 
+    audios=[load_audio('AUDIO_CLIP_FOR_VOICE_CLONING.wav', audio_tokenizer.sample_rate)],
+    return_tensors="pt"
+)
+
+import torch
+
+with torch.inference_mode():
+    # Generate up to 50 new frames
+    gen_frames = model.generate(
+        input_ids=inputs['input_ids'].cuda(),
+        attention_mask=inputs['attention_mask'].cuda(),
+        max_new_frames=50,
+        topk=50,
+        temperature=1.0,
+        use_cache=True,
+        stop_on_all_zeros=True,
+
+    )
+
+decoded_audio = audio_tokenizer.decode(gen_frames.permute(0, 2, 1)).squeeze(0).squeeze(0)
+
+audio_array = (decoded_audio * 32768).to(torch.int16).cpu().numpy()
+
+# Audio can be played with the following code:
+# from IPython.display import Audio
+# Audio(audio_array, rate=audio_tokenizer.sample_rate)
+```
+
 ## TODO
 
 - [x] Two-stage autoregressive architecture implementation
