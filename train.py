@@ -213,6 +213,15 @@ class CustomTrainingArguments(TrainingArguments):
     dataloader_num_workers: int = field(
         default=0, metadata={"help": "Number of workers for dataloader"}
     )
+    logging_steps: int = field(
+        default=1, metadata={"help": "Log every X updates steps"}
+    )
+    save_strategy: str = field(
+        default="epoch", metadata={"help": "The checkpoint save strategy to use"}
+    )
+    save_total_limit: int = field(
+        default=3, metadata={"help": "Maximum number of checkpoints to keep"}
+    )
 
 
 def load_llama3_tokenizer():
