@@ -239,7 +239,7 @@ class ModelArguments:
     """
 
     model_name_or_path: Optional[str] = field(
-        default=None,
+        default="thomasgauthier/csm-1b-hf",
         metadata={"help": "Path to a pretrained CSM model, or identifier on HF Hub."},
     )
 
