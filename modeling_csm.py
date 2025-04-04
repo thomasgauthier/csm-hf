@@ -54,101 +54,111 @@ class CSMOutput(ModelOutput):
 class CSMConfig(PretrainedConfig):
     """
     Configuration holding two "sub-configs":
-      - backbone_config: the Llama parameters for the main backbone
-      - decoder_config:  the Llama parameters for the smaller decoder
+      - backbone_config: the LlamaConfig for the main backbone
+      - decoder_config:  the LlamaConfig for the smaller decoder
     Also stores text_vocab_size, audio_vocab_size, and audio_num_codebooks.
     """
     model_type = "csm"
 
     def __init__(
         self,
-        backbone_flavor="llama-1B",
-        decoder_flavor="llama-100M",
         text_vocab_size=128256,
         audio_vocab_size=2051,
         audio_num_codebooks=32,
         max_seq_len=2048,
+        backbone_config=LlamaConfig(
+            vocab_size=128256,
+            hidden_size=2048,
+            intermediate_size=8192,
+            num_hidden_layers=16,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            max_position_embeddings=2048,
+            rms_norm_eps=1e-5,
+            attention_dropout=0.0,
+            rope_theta=500000,
+            rope_scaling={
+                "type": "llama3",
+                "factor": 32.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192,
+            },
+            architectures=["LlamaForCausalLM"],
+            hidden_act="silu",
+        ),
+        decoder_config=LlamaConfig(
+            vocab_size=128256,
+            hidden_size=1024,
+            intermediate_size=8192,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            rms_norm_eps=1e-5,
+            attention_dropout=0.0,
+            rope_theta=500000,
+            rope_scaling={
+                "type": "llama3",
+                "factor": 32.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192,
+            },
+            architectures=["LlamaForCausalLM"],
+            hidden_act="silu",
+        ),
         **kwargs,
     ):
-        self.backbone_flavor = backbone_flavor
-        self.decoder_flavor = decoder_flavor
+        # Set parameters
         self.text_vocab_size = text_vocab_size
         self.audio_vocab_size = audio_vocab_size
         self.audio_num_codebooks = audio_num_codebooks
         self.max_seq_len = max_seq_len
-
-        # Depending on the chosen flavor (e.g. "llama-1B"), define hidden sizes, etc.
-        if backbone_flavor == "llama-1B":
-            self.backbone_config = {
-                "hidden_size": 2048,
-                "intermediate_size": 8192,
-                "num_hidden_layers": 16,
-                "num_attention_heads": 32,
-                "num_key_value_heads": 8,
-                "rms_norm_eps": 1e-5,
-            }
-        elif backbone_flavor == "llama-100M":
-            self.backbone_config = {
-                "hidden_size": 1024,
-                "intermediate_size": 8192,
-                "num_hidden_layers": 4,
-                "num_attention_heads": 8,
-                "num_key_value_heads": 2,
-                "rms_norm_eps": 1e-5,
-            }
+        
+        # Create new config objects to avoid modifying the defaults
+        # For backbone config
+        if isinstance(backbone_config, dict):
+            # If it's a dict (from JSON), create a LlamaConfig from it
+            self.backbone_config = LlamaConfig(**backbone_config)
         else:
-            raise ValueError(f"Unknown backbone flavor: {backbone_flavor}")
-
-        if decoder_flavor == "llama-1B":
-            self.decoder_config = {
-                "hidden_size": 2048,
-                "intermediate_size": 8192,
-                "num_hidden_layers": 16,
-                "num_attention_heads": 32,
-                "num_key_value_heads": 8,
-                "rms_norm_eps": 1e-5,
-            }
-        elif decoder_flavor == "llama-100M":
-            self.decoder_config = {
-                "hidden_size": 1024,
-                "intermediate_size": 8192,
-                "num_hidden_layers": 4,
-                "num_attention_heads": 8,
-                "num_key_value_heads": 2,
-                "rms_norm_eps": 1e-5,
-            }
+            # If it's already a LlamaConfig, make a copy to avoid modifying the original
+            self.backbone_config = LlamaConfig(**backbone_config.to_dict())
+        
+        # Update the new config
+        self.backbone_config.vocab_size = text_vocab_size
+        self.backbone_config.max_position_embeddings = max_seq_len
+        
+        # For decoder config
+        if isinstance(decoder_config, dict):
+            # If it's a dict (from JSON), create a LlamaConfig from it
+            self.decoder_config = LlamaConfig(**decoder_config)
         else:
-            raise ValueError(f"Unknown decoder flavor: {decoder_flavor}")
+            # If it's already a LlamaConfig, make a copy to avoid modifying the original
+            self.decoder_config = LlamaConfig(**decoder_config.to_dict())
+        
+        # Update the new config
+        self.decoder_config.vocab_size = text_vocab_size
+        self.decoder_config.max_position_embeddings = audio_num_codebooks
 
         super().__init__(**kwargs)
 
 
-def _create_llama_config(model_params, max_seq_len):
+def topk_multinomial_sampling(logits: torch.Tensor, topk: int, temperature: float):
     """
-    Creates a LlamaConfig from a dict of model_params (like hidden_size, etc.)
-    and a maximum sequence length. This includes settings for rope scaling.
+    Simple top-k sampling: keep only the top-k logits, scale by temperature,
+    draw a single sample from the resulting distribution.
     """
-    return LlamaConfig(
-        vocab_size=128256,  # usually matches text_vocab_size
-        hidden_size=model_params["hidden_size"],
-        num_hidden_layers=model_params["num_hidden_layers"],
-        num_attention_heads=model_params["num_attention_heads"],
-        num_key_value_heads=model_params["num_key_value_heads"],
-        intermediate_size=model_params["intermediate_size"],
-        max_position_embeddings=max_seq_len,
-        rms_norm_eps=model_params["rms_norm_eps"],
-        attention_dropout=0.0,
-        rope_theta=500000,  # a large value
-        rope_scaling={
-            "type": "llama3",
-            "factor": 32.0,
-            "low_freq_factor": 1.0,
-            "high_freq_factor": 4.0,
-            "original_max_position_embeddings": 8192,
-        },
-        architectures=["LlamaForCausalLM"],
-        hidden_act="silu",
-    )
+    # (Optionally apply temperature)
+    logits = logits / temperature
+    # Filter to top-k
+    topvals, topidx = torch.topk(logits, k=topk, dim=-1)
+    probs = torch.nn.functional.softmax(topvals, dim=-1)
+    # Draw from the distribution
+    sample_rel = torch.multinomial(probs, num_samples=1)  # index in [0..topk-1]
+    # Map back to absolute token IDs
+    sample_abs = torch.gather(topidx, -1, sample_rel)
+    return sample_abs
 
 
 def create_llama_backbone(config):
@@ -156,10 +166,9 @@ def create_llama_backbone(config):
     Builds the Llama backbone. We set embed_tokens to nn.Identity() because
     we will manually embed text+audio outside of the LlamaModel.
     """
-    llama_config = _create_llama_config(config.backbone_config, config.max_seq_len)
-    backbone = LlamaModel(llama_config)
+    backbone = LlamaModel(config.backbone_config)
     backbone.embed_tokens = nn.Identity()
-    return backbone, config.backbone_config["hidden_size"]
+    return backbone, config.backbone_config.hidden_size
 
 
 def create_llama_decoder(config):
@@ -167,10 +176,9 @@ def create_llama_decoder(config):
     Builds the Llama decoder. We set max_seq_len = audio_num_codebooks because
     the decoder processes codebooks [0..N-1] within a single frame, typically up to 32 codebooks.
     """
-    llama_config = _create_llama_config(config.decoder_config, config.audio_num_codebooks)
-    decoder = LlamaModel(llama_config)
+    decoder = LlamaModel(config.decoder_config)
     decoder.embed_tokens = nn.Identity()
-    return decoder, config.decoder_config["hidden_size"]
+    return decoder, config.decoder_config.hidden_size
 
 
 def _multinomial_sample_one_no_sync(probs):
@@ -325,18 +333,9 @@ class CSMModel(PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         use_cache = use_cache if use_cache is not None else self._using_kv_cache
 
-        # Create position IDs if missing
-        if position_ids is None:
-            batch_size, seq_len = input_ids.size()[:2]
-            position_ids = (
-                torch.arange(seq_len, device=input_ids.device)
-                .unsqueeze(0)
-                .repeat(batch_size, 1)
-            )
-
         # 1) embed
         embeds = self._embed_tokens(input_ids)  # [B, S, N+1, H]
-        masked_embeds = embeds * attention_mask.unsqueeze(-1)  # zero out absent tokens
+        masked_embeds = embeds * attention_mask.unsqueeze(-1) if attention_mask is not None else embeds # zero out absent tokens
         # sum across the N+1 dimension => [B, S, H]
         h = masked_embeds.sum(dim=2)
 
@@ -350,8 +349,8 @@ class CSMModel(PreTrainedModel):
         backbone_outputs = self.backbone(
             inputs_embeds=h,
             attention_mask=hf_attention_mask,
-            position_ids=position_ids,
             past_key_values=past_key_values,
+            position_ids=position_ids,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -568,3 +567,114 @@ class CSMModel(PreTrainedModel):
             backbone_loss=None,
             decoder_loss=None,
         )
+    
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_new_frames: int = 100,
+        temperature: float = 1.0,
+        topk: int = 50,
+        use_cache: bool = True,
+        stop_on_all_zeros: bool = True,
+    ):
+        r"""
+        Autoregressively generate multiple audio frames (each consisting of 32 codebook tokens),
+        using the internal `generate_frame(...)` method at every step.
+
+        * **KV Cache**: We pass `past_key_values` forward at each iteration so the
+          backbone does not re-encode all previous frames from scratch.
+        * **Context**: The first call uses your full `input_ids` / `attention_mask` as context.
+          Subsequent calls only feed the newly generated frame to the backbone,
+          while the old context is implicitly in `past_key_values`.
+        * **Stopping**: If `stop_on_all_zeros=True`, we break if the model
+          generates an all-zero frame (often used as a naive "end of audio" condition).
+
+        **Args**:
+          - **input_ids**: shape `[B, T, 33]` (if 32 codebooks + 1 text column)  
+            The initial context frames.  If you have no prior frames and only text,
+            you can supply something like `[B, text_length, 33]` with codebooks=0 and
+            text tokens in the last column.
+          - **attention_mask**: same shape, marking which tokens are valid (1) vs. padded (0).
+          - **max_new_frames**: how many new frames to generate.
+          - **temperature**: sampling temperature for codebook generation.
+          - **topk**: top-k sampling cutoff.
+          - **use_cache**: whether to pass the key/value cache forward.
+          - **stop_on_all_zeros**: if `True`, stop generation as soon as a frame of all zeros
+            is produced.
+        
+        **Returns**:
+          - A tensor of shape `[B, n_frames, 32]` containing all newly generated frames.
+            If none are generated, returns an empty tensor `[B, 0, 32]`.
+        """
+
+        device = input_ids.device
+        batch_size = input_ids.size(0)
+
+        # We will collect new frames (each is [B, 32]) in a list.
+        generated_frames = []
+
+        # Keep track of the backbone's KV cache from step to step.
+        backbone_past_key_values = None
+
+        # For each new frame:
+        running_input_ids = input_ids
+        running_attention_mask = attention_mask
+
+        # We also need to keep track of the "current position IDs":
+        # By default if you pass None, HF will generate them. But for
+        # incremental decoding, it is typical to increment them manually.
+        # If your model's rope setup handles it automatically, you can set `position_ids=None`.
+        position_ids = None
+
+        for frame_idx in range(max_new_frames):
+            # Run 'generate_frame(...)' to produce the *next* frame's 32 codebook tokens
+            # from the current context (which might be the full conversation the first time,
+            # and a single frame + KV cache thereafter).
+            out = self.generate_frame(
+                input_ids=running_input_ids,
+                attention_mask=attention_mask if frame_idx == 0 else None,
+                temperature=temperature,
+                topk=topk,
+                past_key_values=backbone_past_key_values,
+                use_cache=use_cache,
+                return_dict=True,
+            )
+            new_frame = out.samples  # shape [B, 32]
+            # Update the backbone KV cache
+            backbone_past_key_values = out.past_key_values
+
+            # If the model generated "all zero" frames, treat that as an end-of-audio signal.
+            if stop_on_all_zeros and torch.all(new_frame == 0):
+                break
+
+            # Store the newly generated frame
+            generated_frames.append(new_frame)
+
+            # Prepare for the next iteration.  In HF incremental decoding, you typically feed only
+            # the newly generated token(s) for the next step, while letting `past_key_values`
+            # carry the prior context. Here, one "frame" is effectively the new "token."
+            #
+            # So we build [B, 1, 33] by concatenating the new 32 codebook tokens plus a
+            # "dummy" text column (often 0).  Then we set the attention_mask to 1's for audio
+            # codebooks and 0 for the text column, matching the manual loop approach.
+            zero_text = torch.zeros((batch_size, 1), dtype=new_frame.dtype, device=device)
+            next_row = torch.cat([new_frame, zero_text], dim=1).unsqueeze(1)  # [B, 1, 33]
+            
+            # Create mask with 1's for audio codebooks and 0 for text column
+            # This matches the original manual loop's masking logic where text is masked out
+            next_mask = torch.zeros((batch_size, 1, 33), dtype=running_attention_mask.dtype, device=device)
+            next_mask[:, :, :32] = 1  # Set 1's for the 32 audio codebooks
+            
+            running_input_ids = next_row
+            running_attention_mask = next_mask
+
+        # Combine all newly generated frames into a single tensor:
+        if len(generated_frames) > 0:
+            # shape => [B, num_frames, 32]
+            generated_frames = torch.stack(generated_frames, dim=1)
+        else:
+            # If no frames were generated, return an empty placeholder
+            generated_frames = torch.zeros((batch_size, 0, 32), dtype=torch.long, device=device)
+
+        return generated_frames
