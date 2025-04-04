@@ -1,16 +1,34 @@
 """
-Defines the CSMProcessor, which converts a set of "messages" + audio waveforms
-into model-ready token tensors [S, 33] (if we have 32 audio codebooks + 1 text token).
+CSMProcessor: Preprocess conversation data for multimodal (text/audio) training.
 
-Flow:
-1) Each message has 'role' (like speaker_0) and a content list with "text" or "audio".
-2) For text, we tokenize it into the last column (index 32).
-3) For audio, we pass waveforms through an audio tokenizer (like Mimi) that
-   outputs discrete codebook tokens, which we place in columns [0..31].
-4) We produce 'labels' where text positions are set to -100 to skip text prediction.
+Transforms messages into tensors of shape [B, S, 33]:
+  - Columns 0–31: Audio codebook tokens (for audio frames)
+  - Column 32: Text token (for text frames)
 
-We also implement optional "decoder amortization," randomizing which frames
-fully train codebooks [1..N-1].
+Each frame contains tokens from only one modality:
+  - In a text frame, columns 0–31 are all zeros and column 32 holds a portion of the tokenized text.
+  - In an audio frame, columns 0–31 contain audio codebook tokens and column 32 is zero.
+
+Special tokens:
+  - Text utterances include BOS (beginning-of-sequence) and EOS (end-of-sequence) tokens as provided by the text tokenizer.
+  - An all-zero audio frame (all columns zero) indicates the end of an audio utterance.
+
+Labels use -100 for positions that are ignored during training.
+Optional decoder amortization restricts training to a fraction of frames.
+
+Example sequence:
+  A conversation is represented as an interleaved sequence of frames in a fixed order:
+    [...text_frames_speaker_1, ...audio_frames_speaker_1, ...text_frames_speaker_2, ...audio_frames_speaker_2, etc.]
+
+  For example, consider a conversation with two speakers:
+    1. Speaker 1 utters: "Hello, how are you?"
+       → The utterance is tokenized into multiple text frames. In each text frame, columns 0–31 are zeros and column 32 holds segments of the tokenized text (including BOS/EOS tokens).
+    2. The spoken version of that utterance is tokenized into multiple audio frames. In each audio frame, columns 0–31 hold audio codebook tokens and column 32 is zero.
+       → An all-zero frame marks the end of the audio utterance.
+    3. Speaker 2 utters: "I'm fine, thanks."
+       → The utterance is tokenized into multiple text frames with zeros in columns 0–31 and the tokenized text distributed in column 32 (framed with BOS/EOS at the start and end of the utterance).
+
+  The resulting sequence strictly interleaves text and audio frames in the defined order.
 """
 
 import random
@@ -23,8 +41,11 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 class CSMProcessor(ProcessorMixin):
     def __init__(self, tokenizer: PreTrainedTokenizer, audio_tokenizer):
         """
-        :param tokenizer:      a text tokenizer (e.g. Llama)
-        :param audio_tokenizer: a multi-codebook audio tokenizer (e.g. Mimi)
+        Initialize with text and multi-codebook audio tokenizers.
+
+        Args:
+            tokenizer: Tokenizer for text (e.g., Llama tokenizer).
+            audio_tokenizer: Tokenizer that converts audio into multiple codebooks.
         """
         self.tokenizer = tokenizer
         self.audio_tokenizer = audio_tokenizer
@@ -47,53 +68,55 @@ class CSMProcessor(ProcessorMixin):
         ] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Main entry point to process either:
-         - a single conversation or a batch of multiple conversations
-         - or a single text snippet with speaker_id
+        Convert conversation messages (and optional audio) into input tensors.
 
-        Returns a dict with {input_ids, attention_mask, labels} shaped [B, S, 33],
-        where 33 = 32 codebook columns + 1 text column.
+        Produces:
+          - "input_ids": [B, S, 33] token ids.
+          - "attention_mask": [B, S, 33] binary mask.
+          - "labels": [B, S, 33] targets with -100 for positions to ignore.
 
-        If 'messages' is not None, we parse them:
-          - If there's 'audio', we pass waveforms to self.audio_tokenizer to get codebook tokens.
-          - If there's 'text', we pass it to self.tokenizer for the last column.
-          - We build a single conversation's frames, optionally skip entire messages
-            via messages_training_mask, and optionally do "amortization" on codebooks [1..N-1].
+        Args:
+            messages: Conversation messages (dicts) with text/audio content.
+            text: Single text string (used when messages is None).
+            audios: Audio tensors corresponding to messages.
+            speaker_id: Used in single-text mode to identify the speaker.
+            return_tensors: Output tensor format.
+            padding: Pad sequences to the same length.
+            truncation: Truncate sequences longer than max_length.
+            max_length: Maximum allowed sequence length.
+            amortize_decoder_training: If True, only a subset of frames get decoder labels.
+            amortization_ratio: Determines fraction of frames used for decoder training.
+            messages_training_mask: Boolean or int mask to disable training for certain messages.
 
-        Finally, we might left-pad these sequences in the calling environment if
-        multiple conversations have different lengths.
+        Returns:
+            A dict with keys "input_ids", "attention_mask", and "labels".
         """
         if messages is not None:
-            # Determine if we have a batch of conversations or a single conversation
+            # Ensure messages and audios are batched.
             is_batched = isinstance(messages[0], list) if messages else False
 
             if not is_batched:
-                # Single conversation => wrap in a list
                 messages = [messages]
                 audios = [audios] if audios is not None else [None]
             elif audios is not None and not isinstance(audios[0], list):
-                # If we do have multiple messages but audios is not similarly nested, wrap it
                 audios = [audios]
 
             if messages_training_mask is not None:
                 if not is_batched:
                     if isinstance(messages_training_mask[0], list):
                         raise ValueError(
-                            "`messages_training_mask` looks nested (multiple lists), "
-                            "but we have a single conversation. Must match shapes."
+                            "`messages_training_mask` is nested but expected flat for a single conversation."
                         )
                     messages_training_mask = [messages_training_mask]
 
-            # Process each conversation in the batch
             batch_outputs = []
             for i, convo_messages in enumerate(messages):
                 convo_audios = audios[i] if i < len(audios) else None
-                convo_mask   = None
+                convo_mask = None
                 if messages_training_mask is not None:
                     if i >= len(messages_training_mask):
                         raise ValueError(
-                            f"messages_training_mask has fewer entries "
-                            f"({len(messages_training_mask)}) than conversations ({len(messages)})"
+                            f"messages_training_mask has {len(messages_training_mask)} entries but {len(messages)} conversations were provided."
                         )
                     convo_mask = messages_training_mask[i]
 
@@ -111,54 +134,50 @@ class CSMProcessor(ProcessorMixin):
                     )
                 )
 
-            # Combine results into a single batch dimension
             if return_tensors == "pt":
                 if batch_outputs:
                     max_seq_len = max(
                         output["input_ids"].size(0) for output in batch_outputs
                     )
-
-                    padded_inputs = []
-                    padded_masks  = []
-                    padded_labels = []
+                    padded_inputs, padded_masks, padded_labels = [], [], []
 
                     for output in batch_outputs:
                         seq_len = output["input_ids"].size(0)
                         if seq_len < max_seq_len and padding:
-                            # Left pad
                             padded_input = torch.zeros(max_seq_len, 33).long()
-                            padded_mask  = torch.zeros(max_seq_len, 33)
+                            padded_mask = torch.zeros(max_seq_len, 33)
                             padded_label = torch.full((max_seq_len, 33), -100).long()
 
                             padded_input[max_seq_len - seq_len :] = output["input_ids"]
-                            padded_mask [max_seq_len - seq_len :] = output["attention_mask"]
+                            padded_mask[max_seq_len - seq_len :] = output[
+                                "attention_mask"
+                            ]
                             padded_label[max_seq_len - seq_len :] = output["labels"]
                         else:
                             padded_input = output["input_ids"]
-                            padded_mask  = output["attention_mask"]
+                            padded_mask = output["attention_mask"]
                             padded_label = output["labels"]
 
                         padded_inputs.append(padded_input.unsqueeze(0))
-                        padded_masks .append(padded_mask .unsqueeze(0))
+                        padded_masks.append(padded_mask.unsqueeze(0))
                         padded_labels.append(padded_label.unsqueeze(0))
 
                     return {
-                        "input_ids":      torch.cat(padded_inputs, dim=0),
-                        "attention_mask": torch.cat(padded_masks,  dim=0),
-                        "labels":         torch.cat(padded_labels, dim=0),
+                        "input_ids": torch.cat(padded_inputs, dim=0),
+                        "attention_mask": torch.cat(padded_masks, dim=0),
+                        "labels": torch.cat(padded_labels, dim=0),
                     }
                 else:
-                    # No data
                     return {
-                        "input_ids":      torch.zeros(0, 0, 33),
+                        "input_ids": torch.zeros(0, 0, 33),
                         "attention_mask": torch.zeros(0, 0, 33),
-                        "labels":         torch.zeros(0, 0, 33, dtype=torch.long),
+                        "labels": torch.zeros(0, 0, 33, dtype=torch.long),
                     }
             else:
                 raise ValueError(f"Unsupported return format: {return_tensors}")
 
         elif text is not None and speaker_id is not None:
-            # Single text snippet usage
+            # Wrap single text input as a conversation message.
             message = {
                 "role": f"speaker_{speaker_id}",
                 "content": [{"type": "text", "text": text}],
@@ -175,7 +194,7 @@ class CSMProcessor(ProcessorMixin):
             )
         else:
             raise ValueError(
-                "Must provide either 'messages' or 'text' plus 'speaker_id'"
+                "Must provide either 'messages' or both 'text' and 'speaker_id'."
             )
 
     def _process_messages(
@@ -191,22 +210,23 @@ class CSMProcessor(ProcessorMixin):
         messages_training_mask: Optional[Union[List[int], List[bool]]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Converts an individual conversation into a dictionary:
-          {"input_ids": [S, 33], "attention_mask": [S, 33], "labels": [S, 33]}
+        Convert a single conversation into token, mask, and label tensors.
 
-        Each message can contain text and/or audio. We place text tokens in
-        column 32, audio codebooks in columns [0..31]. The shape index 0, i.e. S,
-        can vary as we accumulate frames.
+        For each message:
+          - Text: Encode with a speaker tag; output zeros in columns 0–31 and place the text token in column 32.
+          - Audio: Encode audio into codebook tokens for columns 0–31; set column 32 to 0.
 
-        We also:
-         - Possibly mark entire messages as non-trainable (label = -100).
-         - Possibly apply "amortization" so codebooks [1..N-1] are only trainable
-           on a random subset of frames (reducing memory usage).
+        Also applies:
+          - Message-level masking via messages_training_mask.
+          - Decoder label amortization (subsample frames for decoder training).
+
+        Returns:
+            Dict with "input_ids", "attention_mask", and "labels" tensors of shape [S, 33].
         """
         device = next(self.audio_tokenizer.parameters()).device
 
         all_tokens = []
-        all_masks  = []
+        all_masks = []
         audio_index = 0
         message_boundaries = []
 
@@ -214,7 +234,7 @@ class CSMProcessor(ProcessorMixin):
             speaker_id = int(message["role"].split("_")[-1])
             keep_message = (
                 True
-                if (messages_training_mask is None)
+                if messages_training_mask is None
                 else bool(messages_training_mask[msg_idx])
             )
 
@@ -230,19 +250,23 @@ class CSMProcessor(ProcessorMixin):
             text = " ".join(text_content)
             start_idx = sum(chunk.size(0) for chunk in all_tokens)
 
-            # embed text
+            # Process text: encode and place token in column 32.
             if text:
-                text_tokens = self.tokenizer.encode(f"[{speaker_id}]{text}")
-                text_frame  = torch.zeros(len(text_tokens), 33).long()
+                # Encode text with explicit BOS/EOS tokens
+                text_tokens = self.tokenizer.encode(
+                    f"[{speaker_id}]{text}", add_special_tokens=True
+                )
+                # Create frames for text tokens (zeros in audio columns, text in last column)
+                text_frame = torch.zeros(len(text_tokens), 33).long()
                 text_frame_mask = torch.zeros(len(text_tokens), 33, dtype=torch.int)
 
                 text_frame[:, -1] = torch.tensor(text_tokens)
                 text_frame_mask[:, -1] = 1
 
                 all_tokens.append(text_frame)
-                all_masks .append(text_frame_mask)
+                all_masks.append(text_frame_mask)
 
-            # embed audio
+            # Process audio: encode into codebook tokens for columns 0–31.
             if (
                 has_audio_content
                 and audios
@@ -253,27 +277,32 @@ class CSMProcessor(ProcessorMixin):
                 audio_index += 1
 
                 if not isinstance(audio_tensor, torch.Tensor):
-                    raise ValueError(f"Audio must be torch.Tensor, got {type(audio_tensor)}")
+                    raise ValueError(
+                        f"Audio must be torch.Tensor, got {type(audio_tensor)}"
+                    )
 
                 with torch.no_grad():
-                    audio_tokens = self.audio_tokenizer.encode(audio_tensor.unsqueeze(0).unsqueeze(0).to(device))[0]
+                    audio_tokens = self.audio_tokenizer.encode(
+                        audio_tensor.unsqueeze(0).unsqueeze(0).to(device)
+                    )[0]
 
-                # add an extra column for EOS
+                # Append EOS as an extra column.
                 eos_frame = torch.zeros(audio_tokens.size(0), 1, device=device)
                 audio_tokens = torch.cat([audio_tokens, eos_frame], dim=1)
 
                 audio_frame = torch.zeros(audio_tokens.size(1), 33).long()
-                audio_frame_mask = torch.zeros(audio_tokens.size(1), 33, dtype=torch.int)
+                audio_frame_mask = torch.zeros(
+                    audio_tokens.size(1), 33, dtype=torch.int
+                )
                 audio_frame[:, :-1] = audio_tokens.transpose(0, 1)
                 audio_frame_mask[:, :-1] = True
 
                 all_tokens.append(audio_frame)
-                all_masks .append(audio_frame_mask)
+                all_masks.append(audio_frame_mask)
             elif has_audio_content:
-                # Audio content declared but no actual audio tensor
                 message_id = message.get("role", "unknown")
                 print(
-                    f"Warning: Audio content type present but no audio tensor provided for message with {message_id}"
+                    f"Warning: Audio content declared but no audio tensor provided for message with {message_id}"
                 )
 
             end_idx = sum(chunk.size(0) for chunk in all_tokens)
@@ -282,23 +311,23 @@ class CSMProcessor(ProcessorMixin):
         if audios and audio_index < len(audios):
             print(f"Warning: {len(audios) - audio_index} audio tensors were not used")
 
-        # Combine into a single [S, 33] matrix
+        # Merge tokens and masks; truncate if sequence exceeds max_length.
         if all_tokens:
-            tokens      = torch.cat(all_tokens, dim=0)
-            tokens_mask = torch.cat(all_masks,  dim=0)
+            tokens = torch.cat(all_tokens, dim=0)
+            tokens_mask = torch.cat(all_masks, dim=0)
             if truncation and tokens.size(0) > max_length:
-                tokens      = tokens     [-max_length:]
+                tokens = tokens[-max_length:]
                 tokens_mask = tokens_mask[-max_length:]
         else:
-            tokens      = torch.zeros(0, 33).long()
+            tokens = torch.zeros(0, 33).long()
             tokens_mask = torch.zeros(0, 33)
 
-        # Build labels (we do not train on text => col 32 => -100)
+        # Create labels: mask positions where attention_mask is 0 and in the text column.
         labels = tokens.clone()
         labels = labels.masked_fill(tokens_mask == 0, -100)
         labels[:, -1] = -100
 
-        # Mark entire messages as -100 if keep_message=False
+        # Apply message-level masking.
         for start_idx, end_idx, keep_msg in message_boundaries:
             if start_idx >= labels.size(0):
                 break
@@ -307,8 +336,7 @@ class CSMProcessor(ProcessorMixin):
             if not keep_msg:
                 labels[start_idx:end_idx, :] = -100
 
-        # Optionally amortize the decoder by training codebooks [1..N-1]
-        # on only 1/(amortization_ratio) frames
+        # Amortize decoder training: retain decoder labels for only a subset of frames.
         if amortize_decoder_training:
             seq_len = labels.shape[0]
             valid_frames = torch.any(labels[:, :-1] != -100, dim=-1)
@@ -322,19 +350,19 @@ class CSMProcessor(ProcessorMixin):
             else:
                 frame_mask = torch.zeros(seq_len, dtype=torch.bool)
 
-            # codebook_mask is a boolean mask of shape [S, 33]
-            # we always keep codebook0 (col 0) and text col (col 32) for valid frames
+            # Always keep labels for codebook0 and the text token.
             codebook_mask = torch.zeros_like(labels, dtype=torch.bool)
             codebook_mask[:, -1] = True
-            valid_frames_mask = torch.any(labels != -100, dim=-1, keepdim=True).expand(-1, 1)
+            valid_frames_mask = torch.any(labels != -100, dim=-1, keepdim=True).expand(
+                -1, 1
+            )
             codebook_mask[:, 0:1] = valid_frames_mask
 
-            # for the randomly selected frames, keep codebooks [1..N-1]
+            # For selected frames, keep labels for codebooks 1..(N-1).
             for s in range(seq_len):
                 if frame_mask[s]:
                     codebook_mask[s, 1:-1] = True
 
-            new_labels = labels.clone()
             new_labels = torch.where(
                 (labels != -100) & ~codebook_mask, torch.full_like(labels, -100), labels
             )

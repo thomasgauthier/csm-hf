@@ -1,14 +1,14 @@
 """
-This file orchestrates training for a CSM model using a standard
-HuggingFace Trainer. We define:
+CSM Training Script
 
-- CSMAudioTextDataset: loads conversation JSON lines, fetches audio from
-  disk, applies the CSMProcessor, and returns a single example.
-- CSMDataCollator: left-pads sequences from different examples to the
-  same length. 
-- We parse CLI arguments to pick train_file, model path, etc.
-- Then we construct a CSMTrainer that logs the separate backbone vs.
-  decoder losses, and run trainer.train().
+Training for a two-stage CSM (Conversational Speech Model) via Hugging Face Trainer.
+
+This script:
+- Creates a custom dataset (`CSMAudioTextDataset`) that reads JSON lines describing multi-turn conversations
+  with text and audio references. Audio is loaded, resampled, and tokenized into discrete codebooks,
+  while text is tokenized into the last column of each frame.
+- Applies a data collator (`CSMDataCollator`) that left-pads frames to align sequences of different lengths.
+- Introduces a custom trainer (`CSMTrainer`) for logging separate backbone vs. decoder losses.
 """
 
 import json
@@ -34,7 +34,6 @@ from transformers import (
 from modeling_csm import CSMConfig, CSMModel
 from processor import CSMProcessor
 
-# Setup logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%m/%d/%Y %H:%M:%S",
@@ -45,24 +44,30 @@ logger = logging.getLogger(__name__)
 
 class CSMAudioTextDataset(Dataset):
     """
-    A dataset that reads a JSONL file, each line describing a "conversation".
-    For each conversation, we load waveforms from disk (if any),
-    and pass them to the CSMProcessor along with the message text.
-    The final output is a dictionary with input_ids, attention_mask, labels.
+    Reads a JSONL file where each line describes a conversation containing text
+    and optional audio references. Loads audio waveforms, applies tokenization,
+    and outputs tensors of shape [S, 33] for each conversation.
+
+    The 'processor' is responsible for converting messages + waveforms into
+    (input_ids, attention_mask, labels). The resulting item has shape [S, 33].
     """
 
-    def __init__(self, data_path, audio_cache_dir=None, processor=None):
+    def __init__(
+        self, data_path, audio_cache_dir=None, processor=None, num_train_epochs=10
+    ):
         """
-        :param data_path: Path to a JSON lines file. Each line is a dict with "messages"
-                          possibly containing "text" or "audio" elements.
-        :param audio_cache_dir: optional directory to store or read local copies of audio
-        :param processor: the CSMProcessor instance
+        Args:
+            data_path: Path to a JSONL file with "messages" describing text/audio content.
+            audio_cache_dir: Optional local directory for storing fetched audio files.
+            processor: CSMProcessor instance handling text/audio tokenization.
+            num_train_epochs: Number of times to repeat the dataset to ensure decoder amortization
+                              randomizes over different frames in each epoch.
         """
         self.data_path = data_path
         self.audio_cache_dir = audio_cache_dir
         self.processor = processor
+        self.num_train_epochs = num_train_epochs
 
-        # Create cache directory if needed
         if audio_cache_dir and not os.path.exists(audio_cache_dir):
             os.makedirs(audio_cache_dir)
 
@@ -70,17 +75,29 @@ class CSMAudioTextDataset(Dataset):
             self.data = [json.loads(line) for line in f]
 
         logger.info(f"Loaded {len(self.data)} conversations from {data_path}")
+        
+        self.amortization_ratio = getattr(processor, "amortization_ratio", 16)
 
     def __len__(self):
-        return len(self.data)
+        """
+        Returns a length that is deliberately larger to repeat data items
+        multiple times. This helps with large-batch training or sampling,
+        and ensures decoder amortization uses different frames each epoch.
+        """
+        return len(self.data) * self.num_train_epochs
 
     def __getitem__(self, idx):
         """
-        For an item, we go through its messages, load any audio from disk,
-        possibly resample it, and feed the text+audio to the CSMProcessor.
-        The result is a single conversation item with shape [S, 33],
-        which we then squeeze out the batch dimension for the trainer.
+        Retrieves the conversation at index `idx % len(self.data)`, loads
+        audio from disk, resamples if needed, and processes text/audio via CSMProcessor.
+
+        Returns:
+            A dict with:
+              "input_ids": [S, 33]
+              "attention_mask": [S, 33]
+              "labels": [S, 33]
         """
+        idx = idx % len(self.data)
         item = self.data[idx]
         messages = item["messages"]
         training_mask = item.get("training_mask", None)
@@ -90,29 +107,27 @@ class CSMAudioTextDataset(Dataset):
             for content in message["content"]:
                 if content["type"] == "audio" and "url" in content:
                     audio_path = content["url"]
-
                     if self.audio_cache_dir:
-                        cache_path = os.path.join(self.audio_cache_dir, os.path.basename(audio_path))
+                        cache_path = os.path.join(
+                            self.audio_cache_dir, os.path.basename(audio_path)
+                        )
                         if os.path.exists(cache_path):
                             audio_path = cache_path
 
                     try:
                         waveform, sample_rate = torchaudio.load(audio_path)
-                        # Convert to mono
                         if waveform.size(0) > 1:
                             waveform = torch.mean(waveform, dim=0, keepdim=True)
-
-                        # Resample if needed
                         if sample_rate != self.processor.sample_rate:
-                            resampler = torchaudio.transforms.Resample(sample_rate, self.processor.sample_rate)
+                            resampler = torchaudio.transforms.Resample(
+                                sample_rate, self.processor.sample_rate
+                            )
                             waveform = resampler(waveform)
-
                         audio_tensors.append(waveform.squeeze(0))
                     except Exception as e:
                         logger.warning(f"Error loading audio {audio_path}: {e}")
                         audio_tensors.append(None)
 
-        # Use the processor to build input tensors
         processed = self.processor(
             messages=messages,
             audios=audio_tensors,
@@ -122,9 +137,8 @@ class CSMAudioTextDataset(Dataset):
             truncation=True,
             max_length=2048,
             amortize_decoder_training=True,
+            amortization_ratio=self.amortization_ratio,
         )
-
-        # The processor returns shape [1, S, 33], so we remove the batch dimension
         return {
             "input_ids": processed["input_ids"].squeeze(0),
             "attention_mask": processed["attention_mask"].squeeze(0),
@@ -135,19 +149,24 @@ class CSMAudioTextDataset(Dataset):
 @dataclass
 class CSMDataCollator:
     """
-    A collator that left-pads sequences so that the final frames
-    line up at the bottom. The model sees them in a temporal order
-    from top to bottom if we consider a strictly causal backbone.
+    Data collator for CSM training. Left-pads sequences so all items in a batch
+    share the same temporal dimension. The model processes frames bottom-to-top
+    in a causal manner.
 
-    For each feature in the batch:
-      - If dimension is [S, 33], and S < max_seq_len in the batch,
-        we create a [pad_rows, 33] region at the top.
-
-    text_pad_token_id: used for any "text" column filler, ensures consistency.
+    text_pad_token_id: Token ID used to fill empty text columns.
     """
+
     text_pad_token_id: int
 
-    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    def __call__(
+        self, features: List[Dict[str, torch.Tensor]]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Gathers a list of features (each containing ["input_ids", "attention_mask", "labels"])
+        and pads them to the same length (max_seq_len) along dimension 0.
+
+        Returns a dict with padded "input_ids", "attention_mask", "labels".
+        """
         if not features:
             return {}
 
@@ -162,12 +181,22 @@ class CSMDataCollator:
                 seq_len, width = tensor.size()
                 if seq_len < max_seq_len:
                     pad_rows = max_seq_len - seq_len
+
                     if key == "labels":
-                        pad_tensor = torch.full((pad_rows, width), -100, dtype=tensor.dtype, device=tensor.device)
+                        pad_tensor = torch.full(
+                            (pad_rows, width),
+                            -100,
+                            dtype=tensor.dtype,
+                            device=tensor.device,
+                        )
                     elif key == "attention_mask":
-                        pad_tensor = torch.zeros((pad_rows, width), dtype=tensor.dtype, device=tensor.device)
+                        pad_tensor = torch.zeros(
+                            (pad_rows, width), dtype=tensor.dtype, device=tensor.device
+                        )
                     else:
-                        pad_tensor = torch.zeros((pad_rows, width), dtype=tensor.dtype, device=tensor.device)
+                        pad_tensor = torch.zeros(
+                            (pad_rows, width), dtype=tensor.dtype, device=tensor.device
+                        )
                         pad_tensor[:, -1] = self.text_pad_token_id
 
                     padded_tensor = torch.cat([pad_tensor, tensor], dim=0)
@@ -183,52 +212,78 @@ class CSMDataCollator:
 @dataclass
 class DataTrainingArguments:
     """
-    CLI arguments for data, e.g. training file path, optional eval file, cache directory.
+    Arguments specifying paths for training and evaluation data, plus optional audio caching.
     """
-    train_file: str = field(metadata={"help": "Path to training data"})
+
+    train_file: str = field(
+        metadata={"help": "Path to the JSONL file containing training data."}
+    )
     eval_file: Optional[str] = field(
-        default=None, metadata={"help": "Path to evaluation data"}
+        default=None,
+        metadata={"help": "Path to a JSONL file containing evaluation data."},
     )
     audio_cache_dir: Optional[str] = field(
-        default=None, metadata={"help": "Directory to cache audio files"}
+        default=None,
+        metadata={"help": "Local directory to store/read cached audio files."},
+    )
+    amortization_ratio: int = field(
+        default=16,
+        metadata={"help": "Amortization ratio for decoder training. Higher values mean fewer frames used for decoder training."},
     )
 
 
 @dataclass
 class ModelArguments:
     """
-    CLI arguments specifying the model to load or create from scratch.
+    Arguments for loading or creating a CSM model from a given path or config.
     """
+
     model_name_or_path: Optional[str] = field(
-        default=None, metadata={"help": "Path to pretrained model"}
+        default=None,
+        metadata={"help": "Path to a pretrained CSM model, or identifier on HF Hub."},
     )
 
 
 @dataclass
 class CustomTrainingArguments(TrainingArguments):
     """
-    Extends the HuggingFace TrainingArguments to include additional fields if desired,
-    such as num_workers for the dataloader.
+    Extension of HF TrainingArguments with extra fields like dataloader_num_workers.
     """
+
     dataloader_num_workers: int = field(
-        default=0, metadata={"help": "Number of workers for dataloader"}
+        default=0, metadata={"help": "Number of workers for data loading."}
     )
     logging_steps: int = field(
-        default=1, metadata={"help": "Log every X updates steps"}
+        default=1, metadata={"help": "Log training metrics every X update steps."}
     )
     save_strategy: str = field(
-        default="epoch", metadata={"help": "The checkpoint save strategy to use"}
+        default="epoch",
+        metadata={"help": "Checkpoint save strategy (e.g., 'epoch', 'steps')."},
     )
     save_total_limit: int = field(
-        default=3, metadata={"help": "Maximum number of checkpoints to keep"}
+        default=3, metadata={"help": "Maximum number of checkpoints to retain."}
+    )
+    learning_rate: float = field(
+        default=5e-6, metadata={"help": "Initial learning rate for training."}
+    )
+    num_train_epochs: float = field(
+        default=3, metadata={"help": "Number of training epochs."}
+    )
+    per_device_train_batch_size: int = field(
+        default=1, metadata={"help": "Batch size per device during training."}
+    )
+    gradient_accumulation_steps: int = field(
+        default=8,
+        metadata={
+            "help": "Number of updates steps to accumulate before performing a backward/update pass."
+        },
     )
 
 
 def load_llama3_tokenizer():
     """
-    Loads a Llama3-based tokenizer from a huggingface model,
-    with an added post-processor for BOS/EOS. This must match
-    what the CSM expects for text tokens.
+    Loads a Llama3-based tokenizer and sets a post-processor for BOS/EOS tokens.
+    This should align with the text token format expected by the CSM model.
     """
     tokenizer_name = "meta-llama/Llama-3.2-1B"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
@@ -238,8 +293,8 @@ def load_llama3_tokenizer():
         single=f"{bos}:0 $A:0 {eos}:0",
         pair=f"{bos}:0 $A:0 {eos}:0 {bos}:1 $B:1 {eos}:1",
         special_tokens=[
-            (f"{bos}", tokenizer.bos_token_id),
-            (f"{eos}", tokenizer.eos_token_id),
+            (bos, tokenizer.bos_token_id),
+            (eos, tokenizer.eos_token_id),
         ],
     )
     return tokenizer
@@ -247,24 +302,25 @@ def load_llama3_tokenizer():
 
 class CSMTrainer(Trainer):
     """
-    Custom Trainer that extracts backbone_loss and decoder_loss from the
-    model's outputs and logs them separately. The rest is standard HF Trainer.
+    Custom trainer for the two-stage CSM model. Logs separate backbone vs. decoder losses for monitoring during training.
     """
 
     def compute_loss(
         self, model, inputs, num_items_in_batch=None, return_outputs=False
     ):
+        """
+        Overrides Trainer's compute_loss to extract backbone_loss and decoder_loss
+        from the model outputs and logs them separately.
+        """
         outputs = model(**inputs)
         loss = outputs.loss
 
-        # If the model returned separate backbone/decoder losses, we can log them
         backbone_loss = outputs.backbone_loss
         decoder_loss = outputs.decoder_loss
 
-        # Log to wandb or other trackers if present
-        if backbone_loss is not None and "wandb" in self.args.report_to:
+        if backbone_loss is not None:
             self.log({"train/backbone_loss": backbone_loss.detach().float().item()})
-        if decoder_loss is not None and "wandb" in self.args.report_to:
+        if decoder_loss is not None:
             self.log({"train/decoder_loss": decoder_loss.detach().float().item()})
 
         return (loss, outputs) if return_outputs else loss
@@ -272,14 +328,14 @@ class CSMTrainer(Trainer):
 
 def main():
     """
-    Main function for training a CSM model:
-     1) parse arguments
-     2) set random seed
-     3) load text + audio tokenizers
-     4) create or load a CSMModel
-     5) create datasets + data collator
-     6) run HF Trainer
-     7) save final model
+    Main entry for CSM training:
+      - Parse command-line arguments (model, data, training config)
+      - Initialize random seed
+      - Load text and audio tokenizers, then combine into a CSMProcessor
+      - Create or load a CSMModel (two-stage: backbone + decoder)
+      - Build train/eval datasets and data collator
+      - Instantiate a custom CSMTrainer and run training
+      - Save final model weights
     """
     parser = HfArgumentParser(
         (ModelArguments, DataTrainingArguments, CustomTrainingArguments)
@@ -299,22 +355,18 @@ def main():
             f"CUDA memory reserved: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB"
         )
     else:
-        logger.warning("CUDA is not available. Using CPU for training.")
+        logger.warning("CUDA is not available, proceeding on CPU.")
 
-    # 1) load text tokenizer
-    logger.info("Loading tokenizers...")
+    logger.info("Loading text tokenizer...")
     text_tokenizer = load_llama3_tokenizer()
 
-    # 2) load audio tokenizer from HF Hub
-    logger.info("Loading mimi audio tokenizer")
+    logger.info("Loading multi-codebook audio tokenizer (Mimi)...")
     mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
     audio_tokenizer = loaders.get_mimi(mimi_weight, device=device)
     audio_tokenizer.set_num_codebooks(32)
 
-    # 3) combine into a single processor
     processor = CSMProcessor(text_tokenizer, audio_tokenizer)
 
-    # 4) create or load model
     if model_args.model_name_or_path:
         logger.info(f"Loading model from {model_args.model_name_or_path}")
         model = CSMModel.from_pretrained(
@@ -326,18 +378,25 @@ def main():
             ),
         )
     else:
-        logger.info("Creating new model from config")
+        logger.info("Creating a new model from default CSMConfig")
         config = CSMConfig()
         model = CSMModel(config)
 
     model.to(device)
-    print("model dtype", model.dtype)
+    logger.info(f"Model dtype: {model.dtype}")
 
-    # 5) create datasets
+    # Store original num_train_epochs for dataset repetition
+    original_num_train_epochs = training_args.num_train_epochs
+    
+    # Set amortization ratio on processor
+    processor.amortization_ratio = data_args.amortization_ratio
+    logger.info(f"Using decoder amortization ratio: {data_args.amortization_ratio}")
+
     train_dataset = CSMAudioTextDataset(
         data_args.train_file,
         audio_cache_dir=data_args.audio_cache_dir,
         processor=processor,
+        num_train_epochs=int(original_num_train_epochs),
     )
 
     eval_dataset = None
@@ -346,12 +405,84 @@ def main():
             data_args.eval_file,
             audio_cache_dir=data_args.audio_cache_dir,
             processor=processor,
+            num_train_epochs=1,  # For eval we don't need to repeat
         )
 
-    # 6) data collator (left pad)
     data_collator = CSMDataCollator(text_pad_token_id=text_tokenizer.eos_token_id)
 
-    # 7) Trainer
+    # Calculate steps_per_old_epoch for proper save/eval scheduling
+    world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    effective_batch_size = (
+        training_args.per_device_train_batch_size
+        * training_args.gradient_accumulation_steps
+        * world_size
+    )
+
+    # Use original dataset length (not the repeated one)
+    original_data_size = len(train_dataset.data)
+    steps_per_old_epoch = (
+        original_data_size + effective_batch_size - 1
+    ) // effective_batch_size  # Ceiling division
+
+    # Override training args to use steps-based scheduling
+    if training_args.save_strategy == "epoch":
+        training_args.save_strategy = "steps"
+        training_args.save_steps = steps_per_old_epoch
+        logger.info(
+            f"Changed save_strategy to 'steps' with save_steps={steps_per_old_epoch}"
+        )
+    elif training_args.save_strategy == "steps" and hasattr(
+        training_args, "save_steps"
+    ):
+        # If already step-based, adjust the steps to account for our dataset repeat trick
+        original_save_steps = training_args.save_steps
+        steps_per_original_epoch = steps_per_old_epoch
+        training_args.save_steps = original_save_steps * steps_per_original_epoch
+        logger.info(
+            f"Adjusted save_steps from {original_save_steps} to {training_args.save_steps}"
+        )
+
+    # Also adjust evaluation strategy if needed
+    if training_args.evaluation_strategy == "epoch":
+        training_args.evaluation_strategy = "steps"
+        training_args.eval_steps = steps_per_old_epoch
+        logger.info(
+            f"Changed evaluation_strategy to 'steps' with eval_steps={steps_per_old_epoch}"
+        )
+    elif training_args.evaluation_strategy == "steps" and hasattr(
+        training_args, "eval_steps"
+    ):
+        original_eval_steps = training_args.eval_steps
+        steps_per_original_epoch = steps_per_old_epoch
+        training_args.eval_steps = original_eval_steps * steps_per_original_epoch
+        logger.info(
+            f"Adjusted eval_steps from {original_eval_steps} to {training_args.eval_steps}"
+        )
+
+    # Set num_train_epochs to 1 since we're handling epochs via dataset repetition
+    training_args.num_train_epochs = 1
+    logger.info(f"Set num_train_epochs=1 (original was {original_num_train_epochs})")
+    logger.info(
+        f"Dataset will be repeated {original_num_train_epochs} times internally"
+    )
+
+    logger.info(f"Original dataset size: {original_data_size}")
+    logger.info(f"Expanded dataset size: {len(train_dataset)}")
+    logger.info(f"Decoder amortization ratio: 1/{data_args.amortization_ratio} of frames")
+
+    memory_opts = []
+    if training_args.gradient_accumulation_steps > 1:
+        memory_opts.append(
+            f"gradient accumulation (steps={training_args.gradient_accumulation_steps})"
+        )
+    if training_args.fp16:
+        memory_opts.append("fp16 mixed precision")
+    elif training_args.bf16:
+        memory_opts.append("bf16 mixed precision")
+    if memory_opts:
+        logger.info(f"Memory optimization: {', '.join(memory_opts)}")
+
+    logger.info("Starting training loop...")
     trainer = CSMTrainer(
         model=model,
         args=training_args,
@@ -360,38 +491,22 @@ def main():
         data_collator=data_collator,
     )
 
-    # Log effective batch size
-    effective_batch_size = (
-        training_args.per_device_train_batch_size
-        * training_args.gradient_accumulation_steps
-    )
-    if torch.cuda.device_count() > 1:
-        effective_batch_size *= torch.cuda.device_count()
-
     logger.info(
-        f"Effective batch size: {effective_batch_size} (per_device_batch={training_args.per_device_train_batch_size} "
-        f"× grad_accum={training_args.gradient_accumulation_steps} × num_gpus={torch.cuda.device_count()})"
+        f"Effective batch size: {effective_batch_size} "
+        f"(per_device_batch={training_args.per_device_train_batch_size} "
+        f"× grad_accum={training_args.gradient_accumulation_steps} "
+        f"× num_gpus={world_size})"
     )
+    logger.info(f"Steps per original epoch: {steps_per_old_epoch}")
+    logger.info(f"Original dataset size: {original_data_size}")
+    logger.info(f"Expanded dataset size: {len(train_dataset)}")
 
-    # memory hints
-    memory_opts = []
-    if training_args.gradient_accumulation_steps > 1:
-        memory_opts.append(f"gradient accumulation (steps={training_args.gradient_accumulation_steps})")
-    if training_args.fp16:
-        memory_opts.append("fp16 mixed precision")
-    elif training_args.bf16:
-        memory_opts.append("bf16 mixed precision")
-
-    if memory_opts:
-        logger.info(f"Memory optimization: {', '.join(memory_opts)}")
-
-    # 8) Train
-    logger.info("Starting training...")
     trainer.train()
 
-    # 9) Save final model
     logger.info(f"Saving final model to {training_args.output_dir}")
     trainer.save_model(training_args.output_dir)
+    logger.info(f"Model saved at {training_args.output_dir}")
+
 
 if __name__ == "__main__":
     main()

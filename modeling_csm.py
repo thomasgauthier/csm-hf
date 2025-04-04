@@ -1,22 +1,21 @@
 """
-Defines the CSMModel class for a two-stage multimodal architecture:
-(1) Backbone (Llama) that processes frames at a coarse level to predict
-    the first (semantic) codebook.
-(2) Decoder (smaller Llama) that refines each frame's representation,
-    predicting the remaining acoustic codebooks one by one.
+CSM (Conversational Speech Model): Two-stage autoregressive architecture for high-quality speech generation.
 
-This is done by embedding text tokens (for textual context) and
-audio codebooks (32 of them) together. Each frame is a combination
-of (up to) 32 audio codebooks plus a single text token.
+Stage 1 (Backbone):
+- Large Llama model processing frame-level sequences
+- Each frame combines 32 codebooks + text token via embedding summation
+- Predicts semantic codebook (c0) for next frame
+- Handles long-range dependencies across conversation turns
 
-Key points:
-- The backbone sees each frame as one "token," formed by summing all
-  audio codebook embeddings (and optionally a text embedding).
-- The decoder then operates within that single frame to produce
-  all remaining codebooks [1..N-1], conditioned on codebook0.
-- This file also contains a specialized generate_frame method for
-  inference, in which we generate codebook0 from the backbone and
-  then decode codebooks [1..N-1] sequentially.
+Stage 2 (Decoder):
+- Smaller Llama model operating within single frames
+- Takes backbone hidden state and next predicted c0 embedding
+- Autoregressively generates acoustic codebooks [1..31]
+- Captures fine acoustic details
+
+Input format: [batch_size, seq_len, audio_num_codebooks+1]
+- First 32 dims: audio codebooks (semantic 0th codebook + 31 acoustic codebooks)
+- Last dim: text token for contextual conditioning
 """
 
 from dataclasses import dataclass
@@ -31,17 +30,16 @@ from transformers.modeling_outputs import ModelOutput
 @dataclass
 class CSMOutput(ModelOutput):
     """
-    The output structure for CSMModel, carrying:
-    - last_hidden_state:   For convenience, the final hidden state from the backbone
-    - logits:              The final frame's codebook0 logits (i.e., the backbone's
-                           predicted distribution for codebook0 at the last position)
-    - past_key_values:     Optional KV cache for inference
-    - samples:             If a generation call is made (generate_frame), the resulting
-                           codebook tokens
-    - loss:                The total training loss
-    - backbone_loss:       The portion of the loss from predicting codebook0
-    - decoder_loss:        The portion of the loss from predicting codebooks [1..N-1]
+    Output structure for CSM's two-stage generation:
+    last_hidden_state: Backbone's final hidden representation
+    logits: Semantic codebook (c0) logits for next frame
+    past_key_values: KV cache for backbone inference
+    samples: Generated codebooks [0..31] from when called with `generate_frame`
+    loss: Combined backbone + decoder loss
+    backbone_loss: Cross-entropy on semantic codebook prediction
+    decoder_loss: Cross-entropy on acoustic codebooks [1..31] prediction
     """
+
     last_hidden_state: torch.FloatTensor = None
     logits: torch.FloatTensor = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
@@ -53,11 +51,12 @@ class CSMOutput(ModelOutput):
 
 class CSMConfig(PretrainedConfig):
     """
-    Configuration holding two "sub-configs":
-      - backbone_config: the LlamaConfig for the main backbone
-      - decoder_config:  the LlamaConfig for the smaller decoder
-    Also stores text_vocab_size, audio_vocab_size, and audio_num_codebooks.
+    Configuration for CSM's two-stage architecture:
+    backbone_config: Large Llama for frame-level sequence processing (~1B params)
+    decoder_config: Small Llama for intra-frame codebook generation (~100M params)
+    Also configures vocab sizes and number of codebooks (32 total)
     """
+
     model_type = "csm"
 
     def __init__(
@@ -115,7 +114,7 @@ class CSMConfig(PretrainedConfig):
         self.audio_vocab_size = audio_vocab_size
         self.audio_num_codebooks = audio_num_codebooks
         self.max_seq_len = max_seq_len
-        
+
         # Create new config objects to avoid modifying the defaults
         # For backbone config
         if isinstance(backbone_config, dict):
@@ -124,11 +123,11 @@ class CSMConfig(PretrainedConfig):
         else:
             # If it's already a LlamaConfig, make a copy to avoid modifying the original
             self.backbone_config = LlamaConfig(**backbone_config.to_dict())
-        
+
         # Update the new config
         self.backbone_config.vocab_size = text_vocab_size
         self.backbone_config.max_position_embeddings = max_seq_len
-        
+
         # For decoder config
         if isinstance(decoder_config, dict):
             # If it's a dict (from JSON), create a LlamaConfig from it
@@ -136,7 +135,7 @@ class CSMConfig(PretrainedConfig):
         else:
             # If it's already a LlamaConfig, make a copy to avoid modifying the original
             self.decoder_config = LlamaConfig(**decoder_config.to_dict())
-        
+
         # Update the new config
         self.decoder_config.vocab_size = text_vocab_size
         self.decoder_config.max_position_embeddings = audio_num_codebooks
@@ -145,37 +144,24 @@ class CSMConfig(PretrainedConfig):
 
 
 def topk_multinomial_sampling(logits: torch.Tensor, topk: int, temperature: float):
-    """
-    Simple top-k sampling: keep only the top-k logits, scale by temperature,
-    draw a single sample from the resulting distribution.
-    """
-    # (Optionally apply temperature)
+    """Sample from top-k filtered distribution with temperature scaling"""
     logits = logits / temperature
-    # Filter to top-k
     topvals, topidx = torch.topk(logits, k=topk, dim=-1)
     probs = torch.nn.functional.softmax(topvals, dim=-1)
-    # Draw from the distribution
     sample_rel = torch.multinomial(probs, num_samples=1)  # index in [0..topk-1]
-    # Map back to absolute token IDs
     sample_abs = torch.gather(topidx, -1, sample_rel)
     return sample_abs
 
 
 def create_llama_backbone(config):
-    """
-    Builds the Llama backbone. We set embed_tokens to nn.Identity() because
-    we will manually embed text+audio outside of the LlamaModel.
-    """
+    """Initialize large Llama backbone with Identity embedding layer"""
     backbone = LlamaModel(config.backbone_config)
     backbone.embed_tokens = nn.Identity()
     return backbone, config.backbone_config.hidden_size
 
 
 def create_llama_decoder(config):
-    """
-    Builds the Llama decoder. We set max_seq_len = audio_num_codebooks because
-    the decoder processes codebooks [0..N-1] within a single frame, typically up to 32 codebooks.
-    """
+    """Initialize small Llama decoder for intra-frame codebook generation"""
     decoder = LlamaModel(config.decoder_config)
     decoder.embed_tokens = nn.Identity()
     return decoder, config.decoder_config.hidden_size
@@ -183,7 +169,7 @@ def create_llama_decoder(config):
 
 def _multinomial_sample_one_no_sync(probs):
     """
-    Multinomial sampling that avoids certain CUDA sync overhead.
+    Multinomial sampling that avoids CUDA sync overhead.
     This technique is often used for efficient sampling in a loop.
     """
     q = torch.empty_like(probs).exponential_(1)
@@ -191,10 +177,7 @@ def _multinomial_sample_one_no_sync(probs):
 
 
 def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
-    """
-    Top-k sampling with temperature for codebook generation, commonly used
-    to limit the distribution to the top k tokens, scaled by temperature.
-    """
+    """Top-k sampling for codebook generation with temperature scaling"""
     logits = logits / temperature
     filter_value: float = -float("Inf")
     kth_val = torch.topk(logits, topk)[0][..., -1, None]
@@ -208,21 +191,21 @@ def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
 
 class CSMModel(PreTrainedModel):
     """
-    Two-stage CSM model:
+    Two-stage autoregressive model for high-quality speech generation:
 
-    1) Backbone (a LlamaModel) processes frames. Each frame is formed by
-       summing the embeddings of up to 32 codebooks + 1 text embedding.
+    Stage 1 (Backbone):
+    - Large Llama processes frame sequences by summing embeddings of 32 codebooks + text
+    - Predicts semantic codebook (c0) capturing linguistic content
+    - Handles long-range context across conversation turns
 
-       It produces 'h' across all frames in the sequence, and predicts codebook0
-       (the "semantic codebook").
+    Stage 2 (Decoder):
+    - Small Llama generates acoustic codebooks [1..31] within each frame
+    - Takes backbone hidden state + c0 embedding as initial sequence tokens
+    - Captures finer acoustic detail
 
-    2) Decoder (a smaller LlamaModel) processes each frame's codebooks
-       to produce codebooks [1..N-1], using separate classification heads
-       (self.audio_head).
-
-    The shape [batch_size, seq_len, audio_num_codebooks+1] is used for input:
-      - columns [0..(N-1)] are the N audio codebooks
-      - column [N] is the text token
+    Input shape: [batch_size, seq_len, 33]
+    - [:, :, :32] - Audio codebooks
+    - [:, :, 32] - Text token
     """
 
     config_class = CSMConfig
@@ -245,7 +228,9 @@ class CSMModel(PreTrainedModel):
         self.projection = nn.Linear(backbone_dim, decoder_dim, bias=False)
 
         # Codebook0 classification head
-        self.codebook0_head = nn.Linear(backbone_dim, config.audio_vocab_size, bias=False)
+        self.codebook0_head = nn.Linear(
+            backbone_dim, config.audio_vocab_size, bias=False
+        )
 
         # Classification heads for codebooks [1..N-1], each a slice in self.audio_head
         self.audio_head = nn.Parameter(
@@ -254,7 +239,6 @@ class CSMModel(PreTrainedModel):
             )
         )
 
-        # Standard HF post_init (e.g. weight initialization)
         self.post_init()
 
         # To track if we use HF's caching
@@ -262,22 +246,32 @@ class CSMModel(PreTrainedModel):
 
     def _embed_audio(self, codebook: int, tokens: torch.Tensor) -> torch.Tensor:
         """
-        Converts a single codebook index + tokens into embeddings.
-        The offset ensures codebook i uses [i * audio_vocab_size .. (i+1)*audio_vocab_size-1].
+        Maps tokens to embeddings for a specific audio codebook.
+
+        Each codebook gets a unique slice of the embedding table by offsetting indices:
+        codebook 0 → [0, vocab_size)
+        codebook 1 → [vocab_size, 2*vocab_size)
+        etc.
+
+        This ensures tokens that share the same ID but come from different codebooks
+        map to distinct embeddings in the shared table.
         """
         return self.audio_embeddings(tokens + codebook * self.config.audio_vocab_size)
 
     def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         """
-        Takes shape [B, S, N+1], where the last column is text, and the
-        first N columns are the audio codebooks. We offset each audio codebook
-        so they map into separate slices of self.audio_embeddings, then combine
-        them into shape [B, S, N+1, H].
-        """
-        # text embedding
-        text_embeds = self.text_embeddings(tokens[:, :, -1]).unsqueeze(-2)  # [B, S, 1, H]
+        Embeds a batch of audio codebooks + text tokens.
 
-        # audio embedding
+        Input: [B, S, 33] where first 32 dims are audio codebooks, last is text
+        Output: [B, S, 33, H] with each token mapped to its embedding
+
+        Audio tokens are offset by codebook index * vocab_size to use distinct embedding regions.
+        Text tokens use a separate embedding table. The embeddings are concatenated along
+        a new dimension to preserve the frame structure.
+        """
+        text_embeds = self.text_embeddings(tokens[:, :, -1]).unsqueeze(
+            -2
+        )  # [B, S, 1, H]
         audio_tokens = tokens[:, :, :-1] + (
             self.config.audio_vocab_size
             * torch.arange(self.config.audio_num_codebooks, device=tokens.device)
@@ -285,21 +279,14 @@ class CSMModel(PreTrainedModel):
         audio_embeds = self.audio_embeddings(audio_tokens.view(-1)).reshape(
             tokens.size(0), tokens.size(1), self.config.audio_num_codebooks, -1
         )  # [B, S, N, H]
-
-        # Concatenate audio codebooks + text in the last dimension
         return torch.cat([audio_embeds, text_embeds], dim=-2)
 
     def setup_caches(self, max_batch_size: int):
-        """
-        Optionally enable cached inference. Not strictly used in training loops.
-        """
+        """Enable KV caching for backbone inference"""
         self._using_kv_cache = True
 
     def reset_caches(self):
-        """
-        Reset any existing caches. The actual HF logic typically
-        handles this automatically by passing past_key_values=None.
-        """
+        """Reset backbone KV cache"""
         pass
 
     def forward(
@@ -328,14 +315,21 @@ class CSMModel(PreTrainedModel):
                passing them to the decoder.
           5) Returns a CSMOutput with optional loss.
 
-        'labels' should match shape [B, S, N+1], with -100 in positions we ignore.
+        Args:
+            labels: Target codebooks [B, S, 33], -100 for masked positions
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
         use_cache = use_cache if use_cache is not None else self._using_kv_cache
 
         # 1) embed
         embeds = self._embed_tokens(input_ids)  # [B, S, N+1, H]
-        masked_embeds = embeds * attention_mask.unsqueeze(-1) if attention_mask is not None else embeds # zero out absent tokens
+        masked_embeds = (
+            embeds * attention_mask.unsqueeze(-1)
+            if attention_mask is not None
+            else embeds
+        )  # zero out absent tokens
         # sum across the N+1 dimension => [B, S, H]
         h = masked_embeds.sum(dim=2)
 
@@ -343,7 +337,9 @@ class CSMModel(PreTrainedModel):
         if attention_mask is not None:
             hf_attention_mask = (attention_mask.sum(dim=-1) > 0).float()
         else:
-            hf_attention_mask = torch.ones(input_ids.size()[:2], device=input_ids.device)
+            hf_attention_mask = torch.ones(
+                input_ids.size()[:2], device=input_ids.device
+            )
 
         # 2) backbone forward => codebook0 logits
         backbone_outputs = self.backbone(
@@ -357,7 +353,9 @@ class CSMModel(PreTrainedModel):
             return_dict=True,
         )
         h = backbone_outputs.last_hidden_state  # [B, S, hidden_size]
-        backbone_past_key_values = backbone_outputs.past_key_values if use_cache else None
+        backbone_past_key_values = (
+            backbone_outputs.past_key_values if use_cache else None
+        )
 
         # codebook0 logits => [B, S, audio_vocab_size]
         c0_all_logits = self.codebook0_head(h)
@@ -387,8 +385,10 @@ class CSMModel(PreTrainedModel):
             loss = backbone_loss
 
             # codebooks [1..N-1] cross-entropy
-            audio_tokens = input_ids[:, :, : self.config.audio_num_codebooks]  # [B, S, N]
-            audio_labels = labels[:, :, : self.config.audio_num_codebooks]      # [B, S, N]
+            audio_tokens = input_ids[
+                :, :, : self.config.audio_num_codebooks
+            ]  # [B, S, N]
+            audio_labels = labels[:, :, : self.config.audio_num_codebooks]  # [B, S, N]
 
             # frames that have no codebook= -100 => skip
             valid_frames_mask = (audio_labels != -100).all(dim=2)
@@ -398,16 +398,25 @@ class CSMModel(PreTrainedModel):
                 num_valid_frames = valid_frame_indices.shape[0]
 
                 # gather hidden states, codebooks, labels for these frames
-                valid_frame_hidden = h[valid_frame_indices[:, 0], valid_frame_indices[:, 1]]
-                valid_frame_codebooks = audio_tokens[valid_frame_indices[:, 0], valid_frame_indices[:, 1]]
-                valid_frame_labels = audio_labels[valid_frame_indices[:, 0], valid_frame_indices[:, 1]]
+                valid_frame_hidden = h[
+                    valid_frame_indices[:, 0], valid_frame_indices[:, 1]
+                ]
+                valid_frame_codebooks = audio_tokens[
+                    valid_frame_indices[:, 0], valid_frame_indices[:, 1]
+                ]
+                valid_frame_labels = audio_labels[
+                    valid_frame_indices[:, 0], valid_frame_indices[:, 1]
+                ]
 
                 # project backbone hidden to decoder dimension
                 projected_frame_hidden = self.projection(valid_frame_hidden)
 
                 # offset each codebook
                 codebook_offsets = (
-                    torch.arange(self.config.audio_num_codebooks, device=valid_frame_codebooks.device)
+                    torch.arange(
+                        self.config.audio_num_codebooks,
+                        device=valid_frame_codebooks.device,
+                    )
                     * self.config.audio_vocab_size
                 )
                 codebook_indices = valid_frame_codebooks + codebook_offsets
@@ -427,21 +436,29 @@ class CSMModel(PreTrainedModel):
                     ],
                     dim=1,
                 )
-                decoder_outputs = self.decoder(inputs_embeds=decoder_inputs, return_dict=True)
+                decoder_outputs = self.decoder(
+                    inputs_embeds=decoder_inputs, return_dict=True
+                )
                 decoder_hidden = decoder_outputs.last_hidden_state  # [f, 1+N, dec_dim]
 
                 # for predicting codebooks [1..N-1], we skip the first hidden pos
-                codebook_hidden = decoder_hidden[:, 1 : self.config.audio_num_codebooks, :]
+                codebook_hidden = decoder_hidden[
+                    :, 1 : self.config.audio_num_codebooks, :
+                ]
 
                 # compute logits for each codebook dimension
-                codebook_logits = torch.einsum("fcd,cdv->fcv", codebook_hidden, self.audio_head)
+                codebook_logits = torch.einsum(
+                    "fcd,cdv->fcv", codebook_hidden, self.audio_head
+                )
                 # shape => [f, N-1, audio_vocab_size]
 
                 codebook_targets = valid_frame_labels[:, 1:]
                 flat_logits = codebook_logits.reshape(-1, self.config.audio_vocab_size)
                 flat_targets = codebook_targets.reshape(-1)
 
-                decoder_loss = nn.CrossEntropyLoss(ignore_index=-100)(flat_logits, flat_targets)
+                decoder_loss = nn.CrossEntropyLoss(ignore_index=-100)(
+                    flat_logits, flat_targets
+                )
             else:
                 decoder_loss = torch.tensor(0.0, device=h.device, dtype=h.dtype)
 
@@ -478,12 +495,13 @@ class CSMModel(PreTrainedModel):
         return_dict=None,
     ):
         """
-        Generates a single audio frame by:
-          1) Running backbone forward pass to get codebook0
-          2) Iteratively decoding codebooks [1..N-1] using the smaller decoder,
-             refeeding the newly generated codebook each time.
+        Generate a single frame's codebooks:
+        1) Backbone predicts semantic codebook (c0)
+        2) Decoder autoregressively generates acoustic codebooks [1..31]
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
         use_cache = use_cache if use_cache is not None else self._using_kv_cache
 
         # forward pass for codebook0
@@ -517,7 +535,9 @@ class CSMModel(PreTrainedModel):
         c0_embed = self._embed_audio(0, c0_sample)
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
         curr_pos = (
-            torch.arange(0, curr_h.size(1), device=curr_h.device).unsqueeze(0).repeat(batch_size, 1)
+            torch.arange(0, curr_h.size(1), device=curr_h.device)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
         )
         projected_h = self.projection(curr_h)
 
@@ -567,7 +587,7 @@ class CSMModel(PreTrainedModel):
             backbone_loss=None,
             decoder_loss=None,
         )
-    
+
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -578,7 +598,7 @@ class CSMModel(PreTrainedModel):
         use_cache: bool = True,
         stop_on_all_zeros: bool = True,
     ):
-        r"""
+        """
         Autoregressively generate multiple audio frames (each consisting of 32 codebook tokens),
         using the internal `generate_frame(...)` method at every step.
 
@@ -590,21 +610,21 @@ class CSMModel(PreTrainedModel):
         * **Stopping**: If `stop_on_all_zeros=True`, we break if the model
           generates an all-zero frame (often used as a naive "end of audio" condition).
 
-        **Args**:
-          - **input_ids**: shape `[B, T, 33]` (if 32 codebooks + 1 text column)  
-            The initial context frames.  If you have no prior frames and only text,
-            you can supply something like `[B, text_length, 33]` with codebooks=0 and
-            text tokens in the last column.
-          - **attention_mask**: same shape, marking which tokens are valid (1) vs. padded (0).
-          - **max_new_frames**: how many new frames to generate.
-          - **temperature**: sampling temperature for codebook generation.
-          - **topk**: top-k sampling cutoff.
-          - **use_cache**: whether to pass the key/value cache forward.
-          - **stop_on_all_zeros**: if `True`, stop generation as soon as a frame of all zeros
-            is produced.
-        
-        **Returns**:
-          - A tensor of shape `[B, n_frames, 32]` containing all newly generated frames.
+        Args:
+            input_ids: shape `[B, T, 33]` (if 32 codebooks + 1 text column)
+                The initial context frames.  If you have no prior frames and only text,
+                you can supply something like `[B, text_length, 33]` with codebooks=0 and
+                text tokens in the last column.
+            attention_mask: same shape, marking which tokens are valid (1) vs. padded (0).
+            max_new_frames: how many new frames to generate.
+            temperature: sampling temperature for codebook generation.
+            topk: top-k sampling cutoff.
+            use_cache: whether to pass the key/value cache forward.
+            stop_on_all_zeros: if `True`, stop generation as soon as a frame of all zeros
+                is produced.
+
+        Returns:
+            A tensor of shape `[B, n_frames, 32]` containing all newly generated frames.
             If none are generated, returns an empty tensor `[B, 0, 32]`.
         """
 
@@ -620,12 +640,6 @@ class CSMModel(PreTrainedModel):
         # For each new frame:
         running_input_ids = input_ids
         running_attention_mask = attention_mask
-
-        # We also need to keep track of the "current position IDs":
-        # By default if you pass None, HF will generate them. But for
-        # incremental decoding, it is typical to increment them manually.
-        # If your model's rope setup handles it automatically, you can set `position_ids=None`.
-        position_ids = None
 
         for frame_idx in range(max_new_frames):
             # Run 'generate_frame(...)' to produce the *next* frame's 32 codebook tokens
@@ -658,14 +672,20 @@ class CSMModel(PreTrainedModel):
             # So we build [B, 1, 33] by concatenating the new 32 codebook tokens plus a
             # "dummy" text column (often 0).  Then we set the attention_mask to 1's for audio
             # codebooks and 0 for the text column, matching the manual loop approach.
-            zero_text = torch.zeros((batch_size, 1), dtype=new_frame.dtype, device=device)
-            next_row = torch.cat([new_frame, zero_text], dim=1).unsqueeze(1)  # [B, 1, 33]
-            
+            zero_text = torch.zeros(
+                (batch_size, 1), dtype=new_frame.dtype, device=device
+            )
+            next_row = torch.cat([new_frame, zero_text], dim=1).unsqueeze(
+                1
+            )  # [B, 1, 33]
+
             # Create mask with 1's for audio codebooks and 0 for text column
             # This matches the original manual loop's masking logic where text is masked out
-            next_mask = torch.zeros((batch_size, 1, 33), dtype=running_attention_mask.dtype, device=device)
+            next_mask = torch.zeros(
+                (batch_size, 1, 33), dtype=running_attention_mask.dtype, device=device
+            )
             next_mask[:, :, :32] = 1  # Set 1's for the 32 audio codebooks
-            
+
             running_input_ids = next_row
             running_attention_mask = next_mask
 
@@ -675,6 +695,8 @@ class CSMModel(PreTrainedModel):
             generated_frames = torch.stack(generated_frames, dim=1)
         else:
             # If no frames were generated, return an empty placeholder
-            generated_frames = torch.zeros((batch_size, 0, 32), dtype=torch.long, device=device)
+            generated_frames = torch.zeros(
+                (batch_size, 0, 32), dtype=torch.long, device=device
+            )
 
         return generated_frames
