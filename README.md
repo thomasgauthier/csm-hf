@@ -27,7 +27,8 @@ from moshi.models import loaders
 from processor import CSMProcessor
 import torchaudio
 
-device = 'cuda'
+device = "cuda"
+
 
 def load_llama3_tokenizer():
     """
@@ -40,10 +41,14 @@ def load_llama3_tokenizer():
     tokenizer._tokenizer.post_processor = TemplateProcessing(
         single=f"{bos}:0 $A:0 {eos}:0",
         pair=f"{bos}:0 $A:0 {eos}:0 {bos}:1 $B:1 {eos}:1",
-        special_tokens=[(f"{bos}", tokenizer.bos_token_id), (f"{eos}", tokenizer.eos_token_id)],
+        special_tokens=[
+            (f"{bos}", tokenizer.bos_token_id),
+            (f"{eos}", tokenizer.eos_token_id),
+        ],
     )
 
     return tokenizer
+
 
 text_tokenizer = load_llama3_tokenizer()
 
@@ -63,46 +68,49 @@ def load_audio(path, target_sr):
 
 
 model = CSMModel.from_pretrained("thomasgauthier/csm-1b-hf", torch_dtype=torch.bfloat16)
-model.to('cuda')
+model.to("cuda")
 
 
 inputs = processor(
     messages=[
         {
-        "role": "speaker_0",
-        "content": [
-            {"type": "text", "text": "<AUDIO_CLIP_TRANSCRIPT>"},
-            {"type": "audio"} # This placeholder is required for audio tokenization (it maps to the first element in the `audios` list passed to the processor)
-        ]
-    },
-            {
-        "role": "speaker_0",
-        "content": [
-            {"type": "text", "text": "Hello, this is voice cloning speaking"},
-            # does not include audio as the model will generate it
-        ]
-    }
-        ], 
-    audios=[load_audio('AUDIO_CLIP_FOR_VOICE_CLONING.wav', audio_tokenizer.sample_rate)],
-    return_tensors="pt"
+            "role": "speaker_0",
+            "content": [
+                {"type": "text", "text": "<AUDIO_CLIP_TRANSCRIPT>"},
+                {
+                    "type": "audio"
+                },  # This placeholder is required for audio tokenization (it maps to the first element in the `audios` list passed to the processor)
+            ],
+        },
+        {
+            "role": "speaker_0",
+            "content": [
+                {"type": "text", "text": "Hello, this is voice cloning speaking"},
+                # does not include audio as the model will generate it
+            ],
+        },
+    ],
+    audios=[
+        load_audio("AUDIO_CLIP_FOR_VOICE_CLONING.wav", audio_tokenizer.sample_rate)
+    ],
+    return_tensors="pt",
 )
-
-import torch
 
 with torch.inference_mode():
     # Generate up to 50 new frames
     gen_frames = model.generate(
-        input_ids=inputs['input_ids'].cuda(),
-        attention_mask=inputs['attention_mask'].cuda(),
+        input_ids=inputs["input_ids"].cuda(),
+        attention_mask=inputs["attention_mask"].cuda(),
         max_new_frames=50,
         topk=50,
         temperature=1.0,
         use_cache=True,
         stop_on_all_zeros=True,
-
     )
 
-decoded_audio = audio_tokenizer.decode(gen_frames.permute(0, 2, 1)).squeeze(0).squeeze(0)
+decoded_audio = (
+    audio_tokenizer.decode(gen_frames.permute(0, 2, 1)).squeeze(0).squeeze(0)
+)
 
 audio_array = (decoded_audio * 32768).to(torch.int16).cpu().numpy()
 
@@ -137,19 +145,19 @@ Example data format:
     {
       "role": "speaker_0",
       "content": [
-        {"type": "text", "text": "We have a chance for a new life here."},
-        {"type": "audio", "url": "clips/example_audio.wav"}
+        {"type": "text", "text": "Hello, I'm a human speaking to CSM. As I interact with the system, my speech is being transcribed and put here."},
+        {"type": "audio", "url": "clips/user_utterance.wav"}
       ]
     },
     {
       "role": "speaker_1",
       "content": [
-        {"type": "text", "text": "Uncle?"},
-        {"type": "audio", "url": "clips/response_audio.wav"}
+        {"type": "text", "text": "Hi, this is CSM speaking."},
+        {"type": "audio", "url": "clips/target_response.wav"}
       ]
     }
   ],
-  "training_mask": [false, true]
+  "training_mask": [false, true] # we train only on the second utterance as the first one will not be generated during inference. Think of it as prompt-response. We don't want to calculate loss on the prompt but it is still included in the sequence for proper conditioning.
 }
 ```
 
@@ -198,6 +206,7 @@ python train.py \
 - [ ] Voice cloning with prompt tuning / prefix optimization
 - [ ] Support for DPO
 - [ ] Support for RL (GRPO, RLOO, etc.)
+- [ ] [Sample packing](https://docs.axolotl.ai/docs/multipack.html) support
 
 ## Acknowledgements
 
