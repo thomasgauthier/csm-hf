@@ -2,7 +2,7 @@
 
 ## Overview
 
-CSM-HF is a Hugging Face implementation of [Sesame's Conversational Speech Model (CSM)](https://www.sesame.com/research/crossing_the_uncanny_valley_of_voice). CSM-HF is a complete rewrite of the [pytorch code provided by Sesame](https://github.com/SesameAILabs/csm). This codebase is designed to be fully compatible with Hugging Face `transformers`, from inference to training.
+CSM-HF is an implementation of [Sesame's Conversational Speech Model (CSM)](https://www.sesame.com/research/crossing_the_uncanny_valley_of_voice) for Hugging Face `transformers`. CSM-HF is a complete rewrite of the [pytorch code provided by Sesame](https://github.com/SesameAILabs/csm). This codebase is designed to be fully compatible with `transformers`, from inference to training.
 
 ## Changes from Sesame's implementation
 
@@ -124,6 +124,33 @@ audio_array = (decoded_audio * 32768).to(torch.int16).cpu().numpy()
 
 Model architecture is discussed in [ARCHITECTURE.md](ARCHITECTURE.md) (written by O1)
 
+## Description of inference process
+
+The model uses a two-stage autoregressive architecture:
+
+1. **Backbone (Inter-frame Processing)**:
+   - Responsible for semantic understanding and in-context learning.
+   - Processes the entire sequence of frames
+   - One sequence is composed of transcripts + audio parts : "\<BOS\>[{Speaker id 1}]: {utterance_1_transcript}\<EOS\>{audio_frames_of_utterance_1}<ALL_ZERO_AUDIO_FRAME>\<BOS\>[{Speaker id 2}]: {utterance_2_transcript}\<EOS\>{audio_frames_of_utterance_2}<ALL_ZERO_AUDIO_FRAME>"
+   - Each frame contains 32 audio codebooks and 1 text token (33 dim total), the audio parts and text parts are mutually exclusive, meaning for each frame with audio the text token is set to zero, and for each frame with text data all codebook tokens are set to 0.
+   - Each frame is fed to the backbone as the summed embeddings of all codebooks + one text token embedding
+   - At each timestep, the backbone generates the 0th codebook (semantic codebook) of the next frame.
+
+2. **Decoder (Intra-frame Processing)**:
+   - Runs for every generated audio frame
+   - Processes a single frame at a time
+   - Generates acoustic codebooks (codebook 1-31)
+   - Generates the 31 codebooks sequentially, conditioned on the hidden state of the backbone at this frame and the 0th codebook embedding of the frame (both projected down to the decoder hidden_dim).
+   - From the decoder point of view, each codebook is treated as a token in the sequence
+
+So inference works like this:
+
+1. The backbone processes user transcript + user audio + TTS input. It generates the 0th codebook of the first generated speech frame.
+2. The decoder is fed the hidden state of backbone at the last frame and the embedding of the newly generated 0th codebook, the decoder runs autogressively for 31 steps, generating codebooks 1-31 of the first generated speech frame.
+3. The embeddings of all generated codebooks are summed and fed to the backbone as a new frame in the sequence. The backbone then generates the 0th codebook of the second generated speech frame.
+4. The decoder runs again, generating codebooks 1-31 for second generated speech frame (again conditioned on backbone hidden state at the last frame and newly generated 0th codebook embedding).
+5. The two stage process repeats autogressively, generating new frames until the backbone outputs 0 as the 0th codebook token (this means end of audio sequence)
+
 ## Training
 
 ### Data Format
@@ -161,23 +188,9 @@ Example data format:
 }
 ```
 
-### Training Process
-
-The model uses a two-stage autoregressive architecture:
-
-1. **Backbone (Inter-frame Processing)**:
-   - Processes the entire sequence of frames
-   - Each frame represents a combined embedding of all codebooks
-   - Handles long-range dependencies between utterances
-
-2. **Decoder (Intra-frame Processing)**:
-   - Processes a single frame at a time
-   - Generates 32 codebooks sequentially (1 semantic + 31 acoustic)
-   - Each codebook is treated as a token in the sequence
-
 Training leverages compute amortization techniques:
-- The zeroth (semantic) codebook is trained on all frames
-- The remaining codebooks (1-31) are trained on only `amortization_ratio` of the frames
+- The backbone is trained on all frames
+- For the decoder, loss is calculated only for `amortization_ratio` of all frames
 - This significantly reduces memory usage while maintaining quality
 
 To train the model:
@@ -202,6 +215,7 @@ python train.py \
 - [x] Proper handling of epoch repetition for decoder amortization
 - [x] Memory optimization techniques (mixed precision, gradient accumulation)
 - [ ] LoRA support for efficient fine-tuning
+- [ ] `GenerationMixin` support
 - [ ] Faster inference with `torch.compile`
 - [ ] Voice cloning with prompt tuning / prefix optimization
 - [ ] Support for DPO
