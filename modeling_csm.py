@@ -399,7 +399,7 @@ class CSMModel(PreTrainedModel):
 
                 # gather hidden states, codebooks, labels for these frames
                 valid_frame_hidden = h[
-                    valid_frame_indices[:, 0], valid_frame_indices[:, 1]
+                    valid_frame_indices[:, 0], valid_frame_indices[:, 1]-1
                 ]
                 valid_frame_codebooks = audio_tokens[
                     valid_frame_indices[:, 0], valid_frame_indices[:, 1]
@@ -647,7 +647,7 @@ class CSMModel(PreTrainedModel):
             # and a single frame + KV cache thereafter).
             out = self.generate_frame(
                 input_ids=running_input_ids,
-                attention_mask=attention_mask if frame_idx == 0 else None,
+                attention_mask=running_attention_mask,
                 temperature=temperature,
                 topk=topk,
                 past_key_values=backbone_past_key_values,
