@@ -1,3 +1,6 @@
+> [!WARNING]
+> CSM support has officially landed in [`transformers`](https://huggingface.co/docs/transformers/main/en/model_doc/csm). I suggest using the mainline implementation over this one.
+
 # CSM-HF
 
 ## Overview
